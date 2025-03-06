@@ -225,6 +225,24 @@
 
     <script src="scripts/script.js"></script>
     <script>
+                // Function to toggle sidebar on mobile
+                function toggleChatSidebar() {
+                    const sidebar = document.getElementById('chatSidebar');
+                    const mainContent = document.getElementById('mainContent'); // Select main content area
+        
+                    if (sidebar.classList.contains('hidden')) {
+                        sidebar.classList.remove('hidden'); // Show sidebar on mobile
+                        sidebar.classList.add('md:flex'); // Make sidebar flex on desktop
+                        mainContent.classList.remove('md:ml-0'); // Remove default margin-left on desktop
+                        mainContent.classList.add('md:ml-64'); // Add margin-left for sidebar space on desktop
+                    } else {
+                        sidebar.classList.add('hidden'); // Hide sidebar on mobile
+                        sidebar.classList.remove('md:flex'); // Remove flex on desktop
+                        mainContent.classList.remove('md:ml-64'); // Remove sidebar margin on desktop
+                        mainContent.classList.add('md:ml-0'); // Reset margin-left to default on desktop
+                    }
+                }
+                
         // Function to add a message to the chat content area
         function addMessage(sender, message) {
             const chatContent = document.getElementById('chat-content');

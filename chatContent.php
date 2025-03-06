@@ -1,3 +1,154 @@
+<?php
+include 'db_init.php';
+require_once 'vendor/autoload.php';
+session_start();
+
+$dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
+$dotenv->load();
+
+$yourApiKey = $_ENV['QWEN_API'];
+
+if (!isset($_SESSION['google_loggedin'])) {
+    header('Location: login.php');
+    exit;
+}
+
+try {
+    $pdo = new PDO($dsn, $dbUser, $dbPass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+    ]);
+} catch (PDOException $e) {
+    die("Database connection failed: " . $e->getMessage());
+}
+
+// Set up the OpenAI client
+$client = OpenAI::factory()
+    ->withApiKey($yourApiKey)
+    ->withBaseUri('https://dashscope-intl.aliyuncs.com/compatible-mode/v1')
+    ->make();
+
+$userId = $_SESSION['google_email'];
+
+// Handle conversation ID
+if (isset($_GET['conversation_id'])) {
+    $conversationId = $_GET['conversation_id'];
+    $_SESSION['conversation_id'] = $conversationId;
+} else {
+    if (isset($_SESSION['conversation_id'])) {
+        $conversationId = $_SESSION['conversation_id'];
+    } else {
+        $conversationId = 'conv_' . uniqid('', true);
+        $_SESSION['conversation_id'] = $conversationId;
+        header("Location: " . $_SERVER['PHP_SELF'] . "?conversation_id=" . urlencode($conversationId));
+        exit;
+    }
+}
+
+function getConversationHistory(PDO $pdo, $sessionId, $conversationId, $userId) {
+    $stmt = $pdo->prepare("SELECT role, content, created_at FROM chat_messages
+                           WHERE session_id = :session_id AND conversation_id = :conversation_id AND user_id = :user_id
+                           ORDER BY created_at ASC");
+    $stmt->execute([
+        ':session_id'      => $sessionId,
+        ':conversation_id' => $conversationId,
+        ':user_id'         => $userId
+    ]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function getConversationTitle(PDO $pdo, $conversationId, $userId) {
+    // Get first user message as the conversation title, truncate if needed
+    $stmt = $pdo->prepare("SELECT content FROM chat_messages
+                          WHERE conversation_id = :conversation_id AND user_id = :user_id AND role = 'user'
+                          ORDER BY created_at ASC LIMIT 1");
+    $stmt->execute([
+        ':conversation_id' => $conversationId,
+        ':user_id'         => $userId
+    ]);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($result) {
+        $title = $result['content'];
+        return (strlen($title) > 30) ? substr($title, 0, 27) . '...' : $title;
+    }
+
+    return 'New Conversation';
+}
+
+function addChatMessage(PDO $pdo, $sessionId, $conversationId, $role, $content, $userId) {
+    $stmt = $pdo->prepare("INSERT INTO chat_messages (session_id, conversation_id, role, content, user_id)
+                           VALUES (:session_id, :conversation_id, :role, :content, :user_id)");
+    $stmt->execute([
+        ':session_id'      => $sessionId,
+        ':conversation_id' => $conversationId,
+        ':role'            => $role,
+        ':content'         => $content,
+        ':user_id'         => $userId
+    ]);
+}
+
+function chatWithQwen($client, PDO $pdo, $conversationId, $userInput, $userId) {
+    addChatMessage($pdo, session_id(), $conversationId, 'user', $userInput, $userId);
+
+    $conversationHistory = getConversationHistory($pdo, session_id(), $conversationId, $userId);
+    $messages = [];
+    $messages[] = [
+        'role'    => 'system',
+        'content' => 'You are a helpful Blog writer who helps people create engaging content for 30 days content calendar'
+    ];
+    foreach ($conversationHistory as $message) {
+        $messages[] = [
+            'role'    => $message['role'],
+            'content' => $message['content']
+        ];
+    }
+
+    try {
+        $result = $client->chat()->create([
+            'model'    => 'qwen-plus',
+            'messages' => $messages
+        ]);
+
+        $assistantResponse = $result->choices[0]->message->content;
+        addChatMessage($pdo, session_id(), $conversationId, 'assistant', $assistantResponse, $userId);
+        return $assistantResponse;
+    } catch (Exception $e) {
+        $errorMsg = "Error: " . $e->getMessage();
+        addChatMessage($pdo, session_id(), $conversationId, 'assistant', $errorMsg, $userId);
+        return $errorMsg;
+    }
+}
+
+// Modified POST handling with PRG pattern
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['message'])) {
+    $userInput = trim($_POST['message']);
+    if ($userInput !== '') {
+        // Store the message in a session variable
+        $_SESSION['pending_message'] = $userInput;
+        // Redirect to the same page with the conversation ID
+        header("Location: " . $_SERVER['PHP_SELF'] . "?conversation_id=" . urlencode($conversationId));
+        exit;
+    }
+}
+
+// Process pending message if it exists
+if (isset($_SESSION['pending_message'])) {
+    $userInput = $_SESSION['pending_message'];
+    chatWithQwen($client, $pdo, $conversationId, $userInput, $userId);
+    // Clear the pending message
+    unset($_SESSION['pending_message']);
+}
+
+// Retrieve conversation history and conversations list
+$chatHistory = getConversationHistory($pdo, session_id(), $conversationId, $userId);
+$stmt = $pdo->prepare("SELECT DISTINCT conversation_id FROM chat_messages WHERE user_id = :user_id ORDER BY MAX(created_at) DESC");
+$stmt->bindValue(':user_id', $userId);
+$stmt->execute();
+$conversations = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+// Check if this is a new conversation without messages
+$isNewConversation = empty($chatHistory);
+?>
 <?php $pageTitle = "Contents Calender"; ?>
 <?php require_once 'layout/header.php'; ?>
 
@@ -6,8 +157,8 @@
 
 
     <div id="mainContent" class="main-content h-screen md:p-4 overflow-hidden md:ml-64">
-        <!-- Header -->
-        <?php require_once 'layout/main-header.php'; ?> 
+         <!-- Header -->
+         <?php require_once 'layout/main-header.php'; ?>
         <div class="flex flex-col glass-card px-3 flex-1 md:h-screen">
 
             <!-- Header -->
@@ -24,49 +175,93 @@
                 <!-- Sidebar (40% width) -->
                 <aside id="chatSidebar"
                     class="md:w-1/3 bg-gray-800 dark:bg-white relative rounded border-gray-700 backdrop-blur-md py-4 px-1 flex md:h-[80%] min-h-72 flex-col">
-
-                    <!-- Content Area -->
-                    <div id="chat-content" class="flex-1 overflow-y-auto scrollbar-thin py-4 space-y-4"
-                        style="max-height: calc(100vh - 250px);">
-
-                        <!-- Chat messages will be dynamically added here -->
-                        <!-- Default Prompt -->
-                            <div class="p-2 bg-gray-700/50 dark:bg-gray-800/50 text-sm backdrop-blur-md rounded-lg shadow-lg self-start break-words">
-                                <p class="dark:text-white"><span id="default-prompt" class="typewriter"></span></p>
-                            </div>
-                     
+                    <!-- Fixed Search Bar -->
+                    <div class="sticky top-0 bg-gray-800/70 dark:bg-white backdrop-blur-md z-10">
+                        <input type="text" id="search-conversation" placeholder="Search conversations..."
+                            class="w-full p-2 rounded-lg bg-gray-700/50 dark:text-black dark:bg-white dark:border-black text-white border border-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:focus:ring-black transition-all duration-300">
                     </div>
 
-                  
-
-                    <div class="sticky bottom-0 flex items-center gap-x-2">
-
-                        <!-- Custom Expanding Input -->
-                        <div id="chat-input" contenteditable="true" role="textbox" onpaste="handlePaste(event)"
-                            class="md:w-[80%] w-[82%] min-h-[5rem] max-h-56 overflow-x-hidden overflow-y-auto dark:text-black min-w-[15ch] p-3 rounded-xl bg-transparent text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-cyan-400 transition-all duration-300 placeholder:text-gray-400"
-                            data-placeholder="Describe your content needs..."></div>
-
-                        <!-- Send Button with Icon -->
-                        <button id="send-button" onclick="sendMessage()"
-                            class="relative flex items-center justify-center w-12 h-12 rounded-full bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 hover:shadow-cyan-400/60 hover:scale-110 transition-all duration-300">
-                            <i class="fas fa-paper-plane text-white text-xl"></i> <!-- Send Icon -->
-
-                        </button>
-
+                    <!-- Scrollable Chat Titles -->
+                    <div class="mt-4 overflow-x-hidden overflow-y-auto scrollbar-thin"
+                        style="max-height: calc(100vh - 280px);">
+                        <?php foreach ($conversations as $conv):
+                            $title = getConversationTitle($pdo, $conv, $userId);
+                            $isActive = ($conv === $conversationId);
+                        ?>
+                        <div class="p-2 rounded-lg cursor-pointer hover:bg-gray-700/40 transition-all duration-300 flex items-center justify-between space-x-3 <?php echo $isActive ? 'bg-gray-700/30' : ''; ?>">
+                            <a href="?conversation_id=<?php echo urlencode($conv); ?>" class="flex items-center space-x-3 flex-grow">
+                                <i class="fas fa-calendar text-blue-400 text-lg"></i>
+                                <span class="text-white text-sm truncate dark:text-black"><?php echo htmlspecialchars($title); ?></span>
+                            </a>
+                            <button class="delete-btn text-red-500 hover:text-red-300" data-conversation-id="<?php echo htmlspecialchars($conv); ?>">
+                                <i class="fas fa-trash-alt"></i>
+                            </button>
+                        </div>
+                        <?php endforeach; ?>
                     </div>
+
                 </aside>
 
                 <!-- Main Chat Section (60% width) -->
                 <main
                     class="flex-1 bg-gray-800 dark:bg-white flex flex-col rounded overflow-hidden border-gray-700 dark:border-gray-700 p-3 h-[80%] relative mb-10">
 
+                    <!-- Content Area -->
+                    <div id="chat-content" class="flex-1 overflow-y-auto scrollbar-thin py-4 space-y-4 <?php echo $isNewConversation ? 'hidden' : ''; ?>"
+                        style="max-height: calc(100vh - 250px);">
+                        <!-- Chat messages -->
+                        <?php if (!empty($chatHistory)): ?>
+                            <?php foreach ($chatHistory as $message): ?>
+                                <?php if ($message['role'] === 'user'): ?>
+                                <div class="flex justify-start items-start space-x-3 mb-4">
+                                    <div class="flex-shrink-0">
+                                        <img src="assets/images/user.png" alt="User" class="w-8 h-8 rounded-full">
+                                    </div>
+                                    <div class="message-user">
+                                        <p><?php echo nl2br(htmlspecialchars($message['content'])); ?></p>
+                                    </div>
+                                </div>
+                                <?php else: ?>
+                                <div class="flex justify-end items-start space-x-3 mb-4">
+                                    <div class="message-assistant">
+                                        <p><?php echo nl2br(htmlspecialchars($message['content'])); ?></p>
+                                    </div>
+                                    <div class="flex-shrink-0 rounded-full border">
+                                        <img src="assets/images/ai.svg" alt="AI" class="w-8 h-8 rounded-full">
+                                    </div>
+                                </div>
+                                <?php endif; ?>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </div>
+
                     <!-- Quick Start Cards (Visible by Default) -->
-                    <div id="quick-start-cards" class="flex-1 overflow-y-auto mt-2 pb-2 md:pb-0 scrollbar-thin"
+                    <div id="quick-start-cards" class="flex-1 overflow-y-auto mt-2 pb-2 md:pb-0 scrollbar-thin <?php echo !$isNewConversation ? 'hidden' : ''; ?>"
                         style="max-height: calc(100vh - 250px);">
                         <div class="grid grid-cols-1 gap-6 px-2">
 
                         </div>
                     </div>
+
+                    <!-- Chat Input Area - THIS WAS MISSING BEFORE -->
+                    <div class="sticky bottom-0 flex items-center gap-x-2">
+                        <form method="POST" class="w-full flex items-center gap-x-2">
+                            <!-- Custom Expanding Input -->
+                            <div id="chat-input" contenteditable="true" role="textbox" name="message-editable"
+                                class="md:w-[93%] w-[82%] min-h-[5rem] max-h-56 overflow-x-hidden overflow-y-auto dark:text-black min-w-[15ch] p-3 rounded-xl bg-transparent text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-cyan-400 transition-all duration-300 placeholder:text-gray-400"
+                                data-placeholder="Describe your content needs..."></div>
+
+                            <!-- Hidden input to hold the actual value -->
+                            <input type="hidden" id="hidden-message" name="message" value="">
+
+                            <!-- Send Button with Icon -->
+                            <button id="send-button" type="submit" onclick="prepareSubmit()"
+                                class="relative flex items-center justify-center w-12 h-12 rounded-full bg-gradient-to-r from-cyan-400 to-blue-600 hover:from-cyan-300 hover:to-blue-500 hover:shadow-cyan-400/60 hover:scale-110 transition-all duration-300">
+                                <i class="fas fa-paper-plane text-white text-xl"></i>
+                            </button>
+                        </form>
+                    </div>
+                    <!-- End Chat Input Area -->
 
 
                 </main>
@@ -78,89 +273,36 @@
 
     <script src="scripts/script.js"></script>
     <script>
-
-
-        // Function to simulate typewriter effect
-        function typeWriter(element, text, speed = 40) {
-            let i = 0;
-            element.innerHTML = ""; // Clear the element
-            const interval = setInterval(() => {
-                if (i < text.length) {
-                    // Replace \n with <br> for line breaks
-                    if (text.charAt(i) === '\n') {
-                        element.innerHTML += '<br>';
-                    } else {
-                        element.innerHTML += text.charAt(i);
-                    }
-                    i++;
-                } else {
-                    clearInterval(interval);
-                }
-            }, speed);
+        // Function to toggle sidebar on mobile
+        function toggleChatSidebar() {
+            const sidebar = document.getElementById('chatSidebar');
+            if (sidebar.classList.contains('w-0')) {
+                sidebar.classList.remove('w-0');
+                sidebar.classList.add('w-3/4');
+            } else {
+                sidebar.classList.remove('w-3/4');
+                sidebar.classList.add('w-0');
+            }
         }
 
-        // Default prompt with typewriter effect
-        const defaultPrompt = `Hi! I'm here to help you plan your content calendar. Here are some things you can ask me:\n\n1. Suggest content ideas for Day 1.\n2. What should I post on Instagram this week?\n3. Generate a 30-day content plan for my fitness blog.\n4. Help me schedule posts for my YouTube channel.\n\nFeel free to ask me anything!`;
-        const promptElement = document.getElementById('default-prompt');
-        typeWriter(promptElement, defaultPrompt);
-
-
-        // Function to add a message to the chat content area
-        function addMessage(sender, message) {
-            const chatContent = document.getElementById('chat-content');
-            const messageElement = document.createElement('div');
-
-            // User message
-            if (sender === 'You') {
-                messageElement.className = 'flex justify-end space-x-3';
-                messageElement.innerHTML = `
-                   
-                    <div class="p-2 bg-blue-600/80 text-sm backdrop-blur-md rounded-lg shadow-lg self-end max-w-[80%] break-words">
-                        <p class="text-white dark:text-black">${message}</p>
-                    </div>
-                `;
-            }
-            // AI message
-            else {
-                messageElement.className = '';
-                messageElement.innerHTML = `
-                    <div class="p-2 bg-gray-700/50 dark:bg-gray-800/50 text-sm backdrop-blur-md rounded-lg shadow-lg self-start break-words">
-                        <p class="text-white" class="typewriter"> ${message}</p>
-                    </div>
-                `;
-            }
-
-            chatContent.appendChild(messageElement);
-            // Scroll to the bottom of the chat content
-            chatContent.scrollTop = chatContent.scrollHeight;
-        }
-
-
-        // Function to handle sending a message
-        function sendMessage() {
+        // Function to prepare form submission
+        function prepareSubmit() {
             const chatInput = document.getElementById('chat-input');
-            const message = chatInput.innerText.trim();
-            document.getElementById('quick-start-cards').classList.add('hidden');
-            document.getElementById('chat-content').classList.remove('hidden');
-
-            if (message) {
-                // Add user's message to the chat
-                addMessage('You', message);
-
-                // Simulate AI response (replace with actual API call in a real app)
-                setTimeout(() => {
-                    addMessage('AI', `Here’s your 30-day content calendar for: "${message}"`);
-                }, 1000);
-
-                // Clear the input field
-                chatInput.innerText = ""; // Clear input
-                chatInput.style.height = "auto"; // Reset height
-            }
+            const hiddenInput = document.getElementById('hidden-message');
+            hiddenInput.value = chatInput.innerText.trim();
         }
 
+        // Function to start a chat from a quick-start card
+        function startChat(message) {
+            const chatInput = document.getElementById('chat-input');
+            const hiddenInput = document.getElementById('hidden-message');
 
-        // Event listener for the send button
-        document.getElementById('send-button').addEventListener('click', sendMessage);
+            chatInput.innerText = message;
+            hiddenInput.value = message;
+
+            // Submit the form
+            document.getElementById('send-button').closest('form').submit();
+        }
 
         // Event listener for pressing Enter in the input field
         document.getElementById('chat-input').addEventListener('keypress', (event) => {
